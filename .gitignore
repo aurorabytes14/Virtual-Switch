@@ -1,3 +1,9 @@
-git add frame.h frame.c mac_table.h mac_table.c .gitignore
-test_mac
+# Object files
 *.o
+
+# Compiled executables
+*.out
+test_mac
+
+# Test directories
+test

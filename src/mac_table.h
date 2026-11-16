@@ -2,7 +2,9 @@
 #define MAC_TABLE_H
 
 #include <stdint.h>
+#include <stddef.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <time.h>
 
 #define MAC_TABLE_BUCKETS 16
@@ -10,7 +12,10 @@
 typedef struct mac_entry {
     uint8_t mac[6];
     int port;
+
     time_t last_seen;
+    uint_fast64_t last_used;
+
     struct mac_entry *next;
 } mac_entry_t;
 
@@ -23,6 +28,15 @@ typedef struct {
     mac_bucket_t buckets[MAC_TABLE_BUCKETS];
 
     pthread_mutex_t capacity_lock;
+
+    pthread_mutex_t aging_lock;
+    pthread_cond_t aging_cond;
+    pthread_t aging_thread;
+
+    int aging_stop;
+    int aging_started;
+
+    atomic_uint_fast64_t access_clock;
 
     size_t count;
     size_t max_entries;
