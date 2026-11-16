@@ -1,9 +1,6 @@
-# Object files
+cat > .gitignore <<'EOF'
 *.o
-
-# Compiled executables
 *.out
 test_mac
-
-# Test directories
-test
+test_frame_io
+EOF
