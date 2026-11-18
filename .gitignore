@@ -1,6 +1,15 @@
-cat > .gitignore <<'EOF'
-*.o
-*.out
-test_mac
-test_frame_io
+cat >> .gitignore <<'EOF'
+
+# Compiled test executables
+test_queue_concurrent
+test_slow_port
+test_disconnect
+test_shm_stats
+test_admin_server
+test_admin_commands
+
+# Application executables
+swctl
+switch
+host
 EOF
