@@ -1,6 +1,11 @@
-cat >> .gitignore <<'EOF'
+# Object and output files
+*.o
+*.out
 
-# Compiled test executables
+# Test executables
+test_mac
+test_frame_io
+test_port_queue
 test_queue_concurrent
 test_slow_port
 test_disconnect
@@ -12,4 +17,3 @@ test_admin_commands
 swctl
 switch
 host
-EOF
