@@ -3,8 +3,9 @@
 
 #include <arpa/inet.h>
 #include <errno.h>
+#include <poll.h>
 #include <pthread.h>
-#include <signal.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -14,36 +15,72 @@
 
 typedef struct {
     int socket_fd;
-    volatile sig_atomic_t running;
+    atomic_int running;
 } host_context_t;
 
 static void print_usage(const char *program)
 {
-    fprintf(stderr, "Usage: %s <switch_ip> <tcp_port> <mac>\n", program);
+    fprintf(
+        stderr,
+        "Usage: %s <switch_ip> <tcp_port> <mac> [vlan]\n",
+        program
+    );
 }
 
+/*
+ * Parse a MAC address in the exact format:
+ * AA:BB:CC:DD:EE:FF
+ */
 static int parse_mac(const char *text, uint8_t mac[6])
 {
-    unsigned int values[6];
-
-    char extra;
-
-    if (sscanf(
-            text,
-            "%2x:%2x:%2x:%2x:%2x:%2x%c",
-            &values[0], &values[1], &values[2],
-            &values[3], &values[4], &values[5],
-            &extra
-        ) != 6) {
+    if (text == NULL || strlen(text) != 17) {
         return -1;
     }
 
     for (int i = 0; i < 6; i++) {
-        if (values[i] > 255) {
+        int position = i * 3;
+
+        if (
+            !(
+                (text[position] >= '0' && text[position] <= '9') ||
+                (text[position] >= 'a' && text[position] <= 'f') ||
+                (text[position] >= 'A' && text[position] <= 'F')
+            )
+        ) {
             return -1;
         }
 
-        mac[i] = (uint8_t)values[i];
+        if (
+            !(
+                (text[position + 1] >= '0' &&
+                 text[position + 1] <= '9') ||
+                (text[position + 1] >= 'a' &&
+                 text[position + 1] <= 'f') ||
+                (text[position + 1] >= 'A' &&
+                 text[position + 1] <= 'F')
+            )
+        ) {
+            return -1;
+        }
+
+        if (i < 5 && text[position + 2] != ':') {
+            return -1;
+        }
+
+        char byte_text[3] = {
+            text[position],
+            text[position + 1],
+            '\0'
+        };
+
+        char *end = NULL;
+        unsigned long value = strtoul(byte_text, &end, 16);
+
+        if (end == byte_text || *end != '\0' || value > 255) {
+            return -1;
+        }
+
+        mac[i] = (uint8_t)value;
     }
 
     return 0;
@@ -61,8 +98,8 @@ static void print_mac(const uint8_t mac[6])
 /*
  * Read the switch's connection response.
  *
- * "OK\n"           means accepted.
- * "switch full\n"  means rejected.
+ * "OK\n"          means accepted.
+ * "switch full\n" means rejected.
  */
 static int receive_connection_response(int socket_fd)
 {
@@ -122,7 +159,7 @@ static void *receiver_thread(void *argument)
 
     printf("Listening for incoming frames...\n");
 
-    while (context->running) {
+    while (atomic_load(&context->running)) {
         uint8_t *frame = NULL;
         size_t frame_size = 0;
 
@@ -138,7 +175,7 @@ static void *receiver_thread(void *argument)
         }
 
         if (result < 0) {
-            if (context->running) {
+            if (atomic_load(&context->running)) {
                 fprintf(
                     stderr,
                     "\nReceive error: %s\n",
@@ -146,6 +183,7 @@ static void *receiver_thread(void *argument)
                 );
             }
 
+            free(frame);
             break;
         }
 
@@ -179,24 +217,17 @@ static void *receiver_thread(void *argument)
 
         printf("Payload:         ");
 
-        size_t available_payload = frame_size - FRAME_HEADER_SIZE;
-        size_t payload_length = header.length;
-
-        if (payload_length > available_payload) {
-            payload_length = available_payload;
-        }
-
-        for (size_t i = 0; i < payload_length; i++) {
+        for (size_t i = 0; i < header.length; i++) {
             putchar(frame[FRAME_HEADER_SIZE + i]);
         }
 
         printf("\n\n");
-
         fflush(stdout);
+
         free(frame);
     }
 
-    context->running = 0;
+    atomic_store(&context->running, 0);
 
     return NULL;
 }
@@ -208,7 +239,8 @@ static int send_user_frame(
     int socket_fd,
     const uint8_t source_mac[6],
     const uint8_t destination_mac[6],
-    const char *message
+    const char *message,
+    uint16_t vlan
 )
 {
     size_t payload_length = strlen(message);
@@ -223,10 +255,11 @@ static int send_user_frame(
     memset(&header, 0, sizeof(header));
 
     header.length = (uint16_t)payload_length;
+
     memcpy(header.src, source_mac, 6);
     memcpy(header.dst, destination_mac, 6);
 
-    header.vlan = 1;
+    header.vlan = vlan;
     header.priority = 1;
 
     size_t frame_size = FRAME_HEADER_SIZE + payload_length;
@@ -268,25 +301,43 @@ static int send_user_frame(
         return -1;
     }
 
-    printf("Frame sent successfully.\n");
+    printf("Frame sent successfully (VLAN %u).\n", vlan);
 
     return 0;
 }
 
+static void print_commands(void)
+{
+    printf("\nAvailable commands:\n");
+    printf("  send <destination_mac> <message>\n");
+    printf("  help\n");
+    printf("  quit\n\n");
+}
+
 int main(int argc, char *argv[])
 {
-    if (argc != 4) {
+    if (argc != 4 && argc != 5) {
         print_usage(argv[0]);
         return EXIT_FAILURE;
     }
 
     const char *switch_ip = argv[1];
 
+    /*
+     * Parse TCP port.
+     */
+    errno = 0;
+
     char *end_pointer = NULL;
 
-    long port_number = strtol(argv[2], &end_pointer, 10);
+    long port_number = strtol(
+        argv[2],
+        &end_pointer,
+        10
+    );
 
     if (
+        errno != 0 ||
         end_pointer == argv[2] ||
         *end_pointer != '\0' ||
         port_number < 1 ||
@@ -296,6 +347,9 @@ int main(int argc, char *argv[])
         return EXIT_FAILURE;
     }
 
+    /*
+     * Parse source MAC address.
+     */
     uint8_t source_mac[6];
 
     if (parse_mac(argv[3], source_mac) != 0) {
@@ -303,6 +357,43 @@ int main(int argc, char *argv[])
         return EXIT_FAILURE;
     }
 
+    /*
+     * Parse VLAN.
+     * Default VLAN: 1.
+     */
+    uint16_t vlan = 1;
+
+    if (argc == 5) {
+        errno = 0;
+        end_pointer = NULL;
+
+        long vlan_number = strtol(
+            argv[4],
+            &end_pointer,
+            10
+        );
+
+        if (
+            errno != 0 ||
+            end_pointer == argv[4] ||
+            *end_pointer != '\0' ||
+            vlan_number < 1 ||
+            vlan_number > 4094
+        ) {
+            fprintf(
+                stderr,
+                "Invalid VLAN ID. Use a value between 1 and 4094.\n"
+            );
+
+            return EXIT_FAILURE;
+        }
+
+        vlan = (uint16_t)vlan_number;
+    }
+
+    /*
+     * Create TCP socket.
+     */
     int socket_fd = socket(AF_INET, SOCK_STREAM, 0);
 
     if (socket_fd < 0) {
@@ -317,25 +408,30 @@ int main(int argc, char *argv[])
     switch_address.sin_family = AF_INET;
     switch_address.sin_port = htons((uint16_t)port_number);
 
-    if (inet_pton(
+    if (
+        inet_pton(
             AF_INET,
             switch_ip,
             &switch_address.sin_addr
-        ) != 1) {
-
+        ) != 1
+    ) {
         fprintf(stderr, "Invalid switch IP address.\n");
         close(socket_fd);
         return EXIT_FAILURE;
     }
 
+    /*
+     * Connect to switch.
+     */
     printf("Connecting to switch...\n");
 
-    if (connect(
+    if (
+        connect(
             socket_fd,
             (struct sockaddr *)&switch_address,
             sizeof(switch_address)
-        ) != 0) {
-
+        ) != 0
+    ) {
         perror("connect");
         close(socket_fd);
         return EXIT_FAILURE;
@@ -362,10 +458,15 @@ int main(int argc, char *argv[])
     print_mac(source_mac);
     printf("\n");
 
+    printf("Your VLAN: %u\n", vlan);
+
+    /*
+     * Initialize shared thread context.
+     */
     host_context_t context;
 
     context.socket_fd = socket_fd;
-    context.running = 1;
+    atomic_init(&context.running, 1);
 
     pthread_t receiver;
 
@@ -387,86 +488,137 @@ int main(int argc, char *argv[])
         return EXIT_FAILURE;
     }
 
-    printf("\nAvailable commands:\n");
-    printf("  send <destination_mac> <message>\n");
-    printf("  help\n");
-    printf("  quit\n\n");
+    print_commands();
 
+    /*
+     * Interactive command loop.
+     *
+     * poll() uses a short timeout so the main thread can
+     * notice when the receiver thread detects disconnection.
+     */
     char input[2048];
 
-    while (context.running) {
+    while (atomic_load(&context.running)) {
+        struct pollfd input_poll;
+
+        input_poll.fd = STDIN_FILENO;
+        input_poll.events = POLLIN;
+        input_poll.revents = 0;
+
         printf("> ");
         fflush(stdout);
 
-        if (fgets(input, sizeof(input), stdin) == NULL) {
-            break;
-        }
+        int poll_result = poll(&input_poll, 1, 250);
 
-        input[strcspn(input, "\n")] = '\0';
-
-        if (strcmp(input, "quit") == 0) {
-            break;
-        }
-
-        if (strcmp(input, "help") == 0) {
-            printf("\nAvailable commands:\n");
-            printf("  send <destination_mac> <message>\n");
-            printf("  help\n");
-            printf("  quit\n\n");
-
-            continue;
-        }
-
-        if (strncmp(input, "send ", 5) == 0) {
-            char *destination_text = input + 5;
-            char *message = strchr(destination_text, ' ');
-
-            if (message == NULL) {
-                printf(
-                    "Usage: send <destination_mac> <message>\n"
-                );
+        if (poll_result < 0) {
+            if (errno == EINTR) {
                 continue;
             }
 
-            *message = '\0';
-            message++;
+            perror("poll");
+            break;
+        }
 
-            uint8_t destination_mac[6];
+        if (poll_result == 0) {
+            continue;
+        }
 
-            if (parse_mac(
+        if (input_poll.revents & (POLLERR | POLLNVAL)) {
+            fprintf(stderr, "Input error.\n");
+            break;
+        }
+
+        if (input_poll.revents & (POLLIN | POLLHUP)) {
+            if (fgets(input, sizeof(input), stdin) == NULL) {
+                break;
+            }
+
+            input[strcspn(input, "\n")] = '\0';
+
+            if (strcmp(input, "quit") == 0) {
+                break;
+            }
+
+            if (strcmp(input, "help") == 0) {
+                print_commands();
+                continue;
+            }
+
+            if (strncmp(input, "send ", 5) == 0) {
+                char *destination_text = input + 5;
+
+                char *message = strchr(
                     destination_text,
-                    destination_mac
-                ) != 0) {
+                    ' '
+                );
 
-                printf("Invalid destination MAC address.\n");
+                if (message == NULL) {
+                    printf(
+                        "Usage: send <destination_mac> <message>\n"
+                    );
+
+                    continue;
+                }
+
+                *message = '\0';
+                message++;
+
+                uint8_t destination_mac[6];
+
+                if (
+                    parse_mac(
+                        destination_text,
+                        destination_mac
+                    ) != 0
+                ) {
+                    printf("Invalid destination MAC address.\n");
+                    continue;
+                }
+
+                if (*message == '\0') {
+                    printf("Message cannot be empty.\n");
+                    continue;
+                }
+
+                if (!atomic_load(&context.running)) {
+                    break;
+                }
+
+                send_user_frame(
+                    socket_fd,
+                    source_mac,
+                    destination_mac,
+                    message,
+                    vlan
+                );
+
                 continue;
             }
 
-            if (*message == '\0') {
-                printf("Message cannot be empty.\n");
-                continue;
+            if (input[0] != '\0') {
+                printf(
+                    "Unknown command. Type 'help' for commands.\n"
+                );
             }
-
-            send_user_frame(
-                socket_fd,
-                source_mac,
-                destination_mac,
-                message
-            );
-
-            continue;
-        }
-
-        if (input[0] != '\0') {
-            printf("Unknown command. Type 'help' for commands.\n");
         }
     }
 
-    context.running = 0;
+    /*
+     * Clean shutdown.
+     */
+    atomic_store(&context.running, 0);
 
     shutdown(socket_fd, SHUT_RDWR);
 
-    pthread_join(receiver, NULL);
+    int join_result = pthread_join(receiver, NULL);
+
+    if (join_result != 0) {
+        fprintf(
+            stderr,
+            "pthread_join: %s\n",
+            strerror(join_result)
+        );
+    }
 
     close(socket_fd);
 

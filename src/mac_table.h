@@ -13,8 +13,9 @@
 
 typedef void (*port_shutdown_callback_t)(int port, void *context);
 
-typedef struct mac_entry 
+typedef struct mac_entry
 {
+    uint16_t vlan;
     uint8_t mac[6];
     int port;
     time_t last_seen;
@@ -69,6 +70,22 @@ int mac_table_set_port_security(
 
 void mac_table_destroy(mac_table_t *table);
 
+/* VLAN-aware MAC table operations. */
+int mac_table_lookup_vlan(
+    mac_table_t *table,
+    uint16_t vlan,
+    const uint8_t mac[6],
+    int *port
+);
+
+int mac_table_insert_vlan(
+    mac_table_t *table,
+    uint16_t vlan,
+    const uint8_t mac[6],
+    int port
+);
+
+/* Backward-compatible operations using VLAN 1. */
 int mac_table_lookup(
     mac_table_t *table,
     const uint8_t mac[6],

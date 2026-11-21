@@ -2,6 +2,11 @@
 *.o
 *.out
 
+# Application executables
+switch
+host
+swctl
+
 # Test executables
 test_mac
 test_frame_io
@@ -12,8 +17,15 @@ test_disconnect
 test_shm_stats
 test_admin_server
 test_admin_commands
+test_qos
+test_rate_limit
+test_vlan_mac
+test_mirror_queue
+test_mirror_isolation
 
-# Application executables
-swctl
-switch
-host
+# ThreadSanitizer executables
+*_tsan
+
+# Python cache
+__pycache__/
+*.pyc

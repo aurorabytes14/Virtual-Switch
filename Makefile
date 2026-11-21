@@ -7,6 +7,7 @@ SRC = src/frame.c \
       src/frame_io.c \
       src/shared_frame.c \
       src/port_queue.c \
+      src/mirror_queue.c \
       src/mac_table.c \
       src/shm_stats.c \
       src/admin_server.c \
@@ -19,8 +20,12 @@ TESTS = test_mac \
         test_slow_port \
         test_disconnect \
         test_shm_stats \
-        test_admin_commands
-
+        test_admin_commands \
+        test_qos \
+        test_rate_limit \
+        test_vlan_mac \
+        test_mirror_queue \
+        test_mirror_isolation
 .PHONY: all clean test run-admin-test
 
 all:switch host swctl
@@ -35,6 +40,9 @@ host: src/frame.c src/frame_io.c src/host.c
 	$(CC) $(CFLAGS) $^ $(LDFLAGS) -o $@
 
 test_mac: src/mac_table.c test/test_mac.c
+	$(CC) $(CFLAGS) $^ $(LDFLAGS) -o $@
+
+test_vlan_mac: src/mac_table.c test/test_vlan_mac.c
 	$(CC) $(CFLAGS) $^ $(LDFLAGS) -o $@
 
 test_frame_io: src/frame.c src/frame_io.c test/test_frame_io.c
@@ -59,6 +67,18 @@ test_admin_commands: $(SRC) test/test_admin_commands.c
 	$(CC) $(CFLAGS) $^ $(LDFLAGS) -o $@
 
 test_admin_server: $(SRC) test/test_admin_server.c
+	$(CC) $(CFLAGS) $^ $(LDFLAGS) -o $@
+
+test_qos: src/frame.c src/frame_io.c src/shared_frame.c src/port_queue.c test/test_qos.c
+	$(CC) $(CFLAGS) $^ $(LDFLAGS) -o $@
+
+test_rate_limit: src/frame.c src/frame_io.c src/shared_frame.c src/port_queue.c test/test_rate_limit.c
+	$(CC) $(CFLAGS) $^ $(LDFLAGS) -o $@
+
+test_mirror_queue: src/frame.c src/frame_io.c src/shared_frame.c src/mirror_queue.c test/test_mirror_queue.c
+	$(CC) $(CFLAGS) $^ $(LDFLAGS) -o $@
+
+test_mirror_isolation: src/frame.c src/frame_io.c src/shared_frame.c src/mirror_queue.c src/port_queue.c test/test_mirror_isolation.c
 	$(CC) $(CFLAGS) $^ $(LDFLAGS) -o $@
 
 test: $(TESTS)

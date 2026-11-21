@@ -8,10 +8,12 @@
 #include "shm_stats.h"
 #include "admin_server.h"
 #include "admin_commands.h"
+#include "mirror_queue.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <pthread.h>
 #include <semaphore.h>
 #include <signal.h>
@@ -21,6 +23,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/un.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -29,6 +32,8 @@
 #define MAC_AGING_SECONDS 300
 #define MAX_MACS_PER_PORT 8
 #define PORT_WAIT_SECONDS 5
+#define MIRROR_QUEUE_CAPACITY 256
+#define SNIFFER_SOCKET_PATH "/tmp/vswitch-sniffer.sock"
 
 typedef struct switch_state switch_state_t;
 
@@ -40,6 +45,11 @@ typedef struct {
     int queue_initialized;
     int thread_started;
     int receiver_done;
+
+    /* VLAN configuration */
+    uint16_t access_vlan;
+    int is_trunk;
+    int mirror_enabled;
 
     pthread_t receiver_thread;
     port_queue_t queue;
@@ -67,7 +77,260 @@ struct switch_state {
     sigset_t signal_set;
     pthread_t signal_thread;
     int signal_thread_started;
+
+    /* Dedicated, independent mirror path for one sniffer client. */
+    int sniffer_listen_fd;
+    int sniffer_fd;
+    pthread_t sniffer_thread;
+    int sniffer_thread_started;
+    pthread_mutex_t mirror_mutex;
+    int mirror_mutex_initialized;
+    mirror_queue_t mirror_queue;
+    int mirror_queue_initialized;
+    int sniffer_connected;
 };
+
+/* Create the UNIX-domain listener used only by the packet sniffer. */
+static void update_stats(
+    switch_state_t *sw,
+    size_t port,
+    uint64_t in,
+    uint64_t out,
+    uint64_t dropped,
+    uint64_t mirrored
+);
+
+static int create_sniffer_listener(void)
+{
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) {
+        return -1;
+    }
+
+    struct sockaddr_un address;
+    memset(&address, 0, sizeof(address));
+    address.sun_family = AF_UNIX;
+
+    if (strlen(SNIFFER_SOCKET_PATH) >= sizeof(address.sun_path)) {
+        close(fd);
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+
+    strcpy(address.sun_path, SNIFFER_SOCKET_PATH);
+    (void)unlink(SNIFFER_SOCKET_PATH);
+
+    if (bind(fd, (struct sockaddr *)&address, sizeof(address)) != 0 ||
+        listen(fd, 1) != 0) {
+        int saved_errno = errno;
+        close(fd);
+        (void)unlink(SNIFFER_SOCKET_PATH);
+        errno = saved_errno;
+        return -1;
+    }
+
+    return fd;
+}
+
+/*
+ * A sniffer is deliberately separate from the host TCP listener and does
+ * not consume a switch port. The queue's sender thread is the only thread
+ * that writes mirrored frames to the sniffer.
+ */
+static void *sniffer_thread_main(void *argument)
+{
+    switch_state_t *sw = argument;
+
+    while (!atomic_load(&sw->stopping)) {
+        struct pollfd listener_poll;
+        listener_poll.fd = sw->sniffer_listen_fd;
+        listener_poll.events = POLLIN;
+        listener_poll.revents = 0;
+
+        int ready = poll(&listener_poll, 1, 250);
+        if (ready < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            if (!atomic_load(&sw->stopping)) {
+                perror("poll sniffer listener");
+            }
+            break;
+        }
+        if (ready == 0 || !(listener_poll.revents & POLLIN)) {
+            continue;
+        }
+
+        int client_fd = accept(sw->sniffer_listen_fd, NULL, NULL);
+        if (client_fd < 0) {
+            if (errno == EINTR || atomic_load(&sw->stopping)) {
+                continue;
+            }
+            perror("accept sniffer");
+            continue;
+        }
+
+        pthread_mutex_lock(&sw->mirror_mutex);
+        int init_result = mirror_queue_init(
+            &sw->mirror_queue, client_fd, MIRROR_QUEUE_CAPACITY);
+        if (init_result == 0) {
+            sw->sniffer_fd = client_fd;
+            sw->mirror_queue_initialized = 1;
+            sw->sniffer_connected = 1;
+            fprintf(stdout, "Sniffer connected on %s\n", SNIFFER_SOCKET_PATH);
+        }
+        pthread_mutex_unlock(&sw->mirror_mutex);
+
+        if (init_result != 0) {
+            perror("mirror_queue_init");
+            close(client_fd);
+            continue;
+        }
+
+        /* Detect a sniffer disconnect without reading its frame stream. */
+        while (!atomic_load(&sw->stopping)) {
+            struct pollfd client_poll;
+            client_poll.fd = client_fd;
+            client_poll.events = POLLIN;
+            client_poll.revents = 0;
+
+            ready = poll(&client_poll, 1, 250);
+            if (ready < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                break;
+            }
+            if (ready == 0) {
+                continue;
+            }
+            if (client_poll.revents & (POLLERR | POLLHUP | POLLNVAL)) {
+                break;
+            }
+            if (client_poll.revents & POLLIN) {
+                char byte;
+                ssize_t peeked = recv(client_fd, &byte, 1,
+                                      MSG_PEEK | MSG_DONTWAIT);
+                if (peeked <= 0) {
+                    break;
+                }
+                /* Sniffer connections are receive-only. */
+                break;
+            }
+        }
+
+        pthread_mutex_lock(&sw->mirror_mutex);
+        sw->sniffer_connected = 0;
+        if (sw->mirror_queue_initialized) {
+            /* destroy() shuts down the socket before joining its sender. */
+            mirror_queue_destroy(&sw->mirror_queue);
+            sw->mirror_queue_initialized = 0;
+        }
+        sw->sniffer_fd = -1;
+        pthread_mutex_unlock(&sw->mirror_mutex);
+
+        close(client_fd);
+        fprintf(stdout, "Sniffer disconnected\n");
+    }
+
+    return NULL;
+}
+
+/* Caller may hold ports_mutex; this helper never acquires it. */
+static void mirror_frame(switch_state_t *sw, size_t port_id,
+                         shared_frame_t *frame)
+{
+    int queued = 0;
+
+    pthread_mutex_lock(&sw->mirror_mutex);
+    if (sw->sniffer_connected && sw->mirror_queue_initialized) {
+        if (mirror_queue_enqueue(&sw->mirror_queue, frame) == 0) {
+            queued = 1;
+        }
+    }
+    pthread_mutex_unlock(&sw->mirror_mutex);
+
+    if (queued) {
+        update_stats(sw, port_id, 0, 0, 0, 1);
+    }
+}
+
+static int set_mirror_callback(void *context, size_t port_id, int enabled)
+{
+    switch_state_t *sw = context;
+    if (sw == NULL || port_id >= sw->num_ports) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    pthread_mutex_lock(&sw->ports_mutex);
+    sw->ports[port_id].mirror_enabled = enabled != 0;
+    pthread_mutex_unlock(&sw->ports_mutex);
+    return 0;
+}
+
+static int show_mirror_callback(void *context, char *response,
+                                size_t response_size)
+{
+    switch_state_t *sw = context;
+    if (sw == NULL || response == NULL || response_size == 0) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    size_t used = 0;
+    pthread_mutex_lock(&sw->ports_mutex);
+    pthread_mutex_lock(&sw->mirror_mutex);
+
+    int written = snprintf(response, response_size,
+                           "Sniffer: %s\n",
+                           sw->sniffer_connected ? "connected" : "disconnected");
+    if (written < 0 || (size_t)written >= response_size) {
+        pthread_mutex_unlock(&sw->mirror_mutex);
+        pthread_mutex_unlock(&sw->ports_mutex);
+        errno = ENOSPC;
+        return -1;
+    }
+    used = (size_t)written;
+
+    size_t queued = 0, dropped = 0, sent = 0, failed = 0;
+    if (sw->mirror_queue_initialized) {
+        pthread_mutex_lock(&sw->mirror_queue.mutex);
+        queued = sw->mirror_queue.count;
+        dropped = sw->mirror_queue.dropped_frames;
+        sent = sw->mirror_queue.sent_frames;
+        failed = sw->mirror_queue.failed_frames;
+        pthread_mutex_unlock(&sw->mirror_queue.mutex);
+    }
+
+    written = snprintf(response + used, response_size - used,
+                       "Queue: %zu | sent: %zu | dropped: %zu | failed: %zu\n",
+                       queued, sent, dropped, failed);
+    if (written < 0 || (size_t)written >= response_size - used) {
+        pthread_mutex_unlock(&sw->mirror_mutex);
+        pthread_mutex_unlock(&sw->ports_mutex);
+        errno = ENOSPC;
+        return -1;
+    }
+    used += (size_t)written;
+
+    for (size_t i = 0; i < sw->num_ports; i++) {
+        written = snprintf(response + used, response_size - used,
+                           "Port %zu: %s\n", i,
+                           sw->ports[i].mirror_enabled ? "mirroring on" : "mirroring off");
+        if (written < 0 || (size_t)written >= response_size - used) {
+            pthread_mutex_unlock(&sw->mirror_mutex);
+            pthread_mutex_unlock(&sw->ports_mutex);
+            errno = ENOSPC;
+            return -1;
+        }
+        used += (size_t)written;
+    }
+
+    pthread_mutex_unlock(&sw->mirror_mutex);
+    pthread_mutex_unlock(&sw->ports_mutex);
+    return 0;
+}
 
 /*
  * Dedicated signal thread. All handled signals are blocked in every
@@ -186,13 +449,23 @@ static void shutdown_port_callback(int port_id, void *context)
 }
 
 /*
- * Forward a frame to every active port except
- * the incoming port.
+ * Access ports accept only their configured VLAN.
+ * Trunk ports carry every valid VLAN.
+ */
+static int port_accepts_vlan(const switch_port_t *port, uint16_t vlan)
+{
+    return port->is_trunk || port->access_vlan == vlan;
+}
+
+/*
+ * Flood a frame only to active ports that carry its VLAN.
+ * The frame's VLAN field is preserved, including on trunk egress.
  */
 static void flood_frame(
     switch_state_t *sw,
     int incoming_port,
-    shared_frame_t *frame
+    shared_frame_t *frame,
+    uint16_t vlan
 )
 {
     pthread_mutex_lock(&sw->ports_mutex);
@@ -202,17 +475,18 @@ static void flood_frame(
 
         if (!port->active ||
             (int)i == incoming_port ||
-            !port->queue_initialized) {
+            !port->queue_initialized ||
+            !port_accepts_vlan(port, vlan)) {
             continue;
         }
 
-        int result = port_queue_enqueue(
-            &port->queue,
-            frame
-        );
+        int result = port_queue_enqueue(&port->queue, frame);
 
         if (result == 0) {
             update_stats(sw, i, 0, 1, 0, 0);
+            if (port->mirror_enabled) {
+                mirror_frame(sw, i, frame);
+            }
         } else {
             update_stats(sw, i, 0, 0, 1, 0);
         }
@@ -234,17 +508,23 @@ static void forward_frame(
 {
     int destination_port = -1;
 
-    int found = mac_table_lookup(
+    int found = mac_table_lookup_vlan(
         &sw->mac_table,
+        header->vlan,
         header->dst,
         &destination_port
     );
 
-    if (is_broadcast_mac(header->dst) ||
-        found != 1||
-        destination_port == incoming_port) {
+    if (is_broadcast_mac(header->dst) || found != 1) {
+        flood_frame(sw, incoming_port, frame, header->vlan);
+        return;
+    }
 
-        flood_frame(sw, incoming_port, frame);
+    /*
+     * The destination is already reachable through the ingress port.
+     * Filter the frame instead of unnecessarily flooding it.
+     */
+    if (destination_port == incoming_port) {
         return;
     }
 
@@ -255,7 +535,9 @@ static void forward_frame(
 
         switch_port_t *port = &sw->ports[destination_port];
 
-        if (port->active && port->queue_initialized) {
+        if (port->active &&
+            port->queue_initialized &&
+            port_accepts_vlan(port, header->vlan)) {
             int result = port_queue_enqueue(
                 &port->queue,
                 frame
@@ -267,6 +549,9 @@ static void forward_frame(
                     (size_t)destination_port,
                     0, 1, 0, 0
                 );
+                if (port->mirror_enabled) {
+                    mirror_frame(sw, (size_t)destination_port, frame);
+                }
             } else {
                 update_stats(
                     sw,
@@ -330,16 +615,50 @@ static void *receiver_thread(void *argument)
         update_stats(sw, (size_t)port->id, 1, 0, 0, 0);
 
         /*
-         * Learn the source MAC address.
+         * Snapshot this port's VLAN mode while holding ports_mutex.
+         * Access ports classify all ingress traffic into their configured
+         * VLAN. Trunk ports retain the VLAN carried in the frame.
          */
-        if (mac_table_insert(
-                &sw->mac_table,
-                header.src,
-                port->id
-            ) == MAC_TABLE_PORT_LIMIT) {
+        pthread_mutex_lock(&sw->ports_mutex);
+        int is_trunk = port->is_trunk;
+        int mirror_enabled = port->mirror_enabled;
+        uint16_t access_vlan = port->access_vlan;
+        pthread_mutex_unlock(&sw->ports_mutex);
 
+        if (!is_trunk) {
+            header.vlan = access_vlan;
+
+            uint8_t serialized_header[FRAME_HEADER_SIZE];
+            if (frame_serialize_header(&header, serialized_header) != 0) {
+                fprintf(stderr, "Could not serialize VLAN header on port %d\n",
+                        port->id);
+                free(data);
+                continue;
+            }
+
+            memcpy(data, serialized_header, FRAME_HEADER_SIZE);
+        }
+
+        /*
+         * Learn the source MAC using both VLAN and MAC address.
+         */
+        int learn_result = mac_table_insert_vlan(
+            &sw->mac_table,
+            header.vlan,
+            header.src,
+            port->id
+        );
+
+        if (learn_result == MAC_TABLE_PORT_LIMIT) {
             free(data);
             break;
+        }
+
+        if (learn_result < 0) {
+            fprintf(stderr, "Could not learn source MAC on port %d: %s\n",
+                    port->id, strerror(errno));
+            free(data);
+            continue;
         }
 
         shared_frame_t *frame = shared_frame_create(
@@ -352,6 +671,11 @@ static void *receiver_thread(void *argument)
         if (frame == NULL) {
             perror("shared_frame_create");
             continue;
+        }
+
+        /* Mirror ingress after access-VLAN classification. */
+        if (mirror_enabled) {
+            mirror_frame(sw, (size_t)port->id, frame);
         }
 
         forward_frame(
@@ -551,6 +875,88 @@ while (sent < sizeof(response) - 1) {
     return 0;
 }
 
+/*
+ * Optional port configuration is selected by port-slot index:
+ *
+ *   SWITCH_PORT_VLANS=10,10,20
+ *       slots 0 and 1 are access VLAN 10; slot 2 is access VLAN 20.
+ *
+ *   SWITCH_TRUNK_PORT=2
+ *       slot 2 is a trunk and carries all VLANs.
+ *
+ * Unspecified access VLANs default to VLAN 1. Configuration is applied
+ * before accepting hosts, so a slot keeps its configuration across
+ * disconnect/reconnect cycles.
+ */
+static int configure_vlan_ports(switch_state_t *sw)
+{
+    for (size_t i = 0; i < sw->num_ports; i++) {
+        sw->ports[i].access_vlan = 1;
+        sw->ports[i].is_trunk = 0;
+    }
+
+    const char *vlan_list = getenv("SWITCH_PORT_VLANS");
+    if (vlan_list != NULL && *vlan_list != '\0') {
+        char *copy = strdup(vlan_list);
+        if (copy == NULL) {
+            return -1;
+        }
+
+        char *saveptr = NULL;
+        char *token = strtok_r(copy, ",", &saveptr);
+        size_t index = 0;
+
+        while (token != NULL && index < sw->num_ports) {
+            char *end = NULL;
+            long vlan = strtol(token, &end, 10);
+
+            if (end == token || *end != '\0' || vlan < 1 || vlan > 4094) {
+                fprintf(stderr, "Invalid VLAN in SWITCH_PORT_VLANS: %s\n",
+                        token);
+                free(copy);
+                return -1;
+            }
+
+            sw->ports[index].access_vlan = (uint16_t)vlan;
+            index++;
+            token = strtok_r(NULL, ",", &saveptr);
+        }
+
+        if (token != NULL) {
+            fprintf(stderr, "Too many entries in SWITCH_PORT_VLANS\n");
+            free(copy);
+            return -1;
+        }
+
+        free(copy);
+    }
+
+    const char *trunk_text = getenv("SWITCH_TRUNK_PORT");
+    if (trunk_text != NULL && *trunk_text != '\0') {
+        char *end = NULL;
+        long trunk_port = strtol(trunk_text, &end, 10);
+
+        if (end == trunk_text || *end != '\0' ||
+            trunk_port < 0 || (size_t)trunk_port >= sw->num_ports) {
+            fprintf(stderr, "Invalid SWITCH_TRUNK_PORT value\n");
+            return -1;
+        }
+
+        sw->ports[trunk_port].is_trunk = 1;
+        fprintf(stdout, "Port slot %ld configured as VLAN trunk\n",
+                trunk_port);
+    }
+
+    for (size_t i = 0; i < sw->num_ports; i++) {
+        if (!sw->ports[i].is_trunk) {
+            fprintf(stdout, "Port slot %zu configured as access VLAN %u\n",
+                    i, (unsigned int)sw->ports[i].access_vlan);
+        }
+    }
+
+    return 0;
+}
+
 static int create_listener(uint16_t tcp_port)
 {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -604,11 +1010,28 @@ static int create_listener(uint16_t tcp_port)
 
 static void cleanup_switch(switch_state_t *sw)
 {
-    atomic_store(&sw->stopping, 1);
+    int was_stopping = atomic_exchange(&sw->stopping, 1);
 
     if (sw->signal_thread_started) {
-        int result = pthread_join(sw->signal_thread, NULL);
 
+        /*
+         * If cleanup was not triggered by a shutdown signal,
+         * wake the signal thread if it is still blocked in sigwait().
+         */
+        if (!was_stopping) {
+            int wake_result = pthread_kill(
+                sw->signal_thread,
+                SIGTERM
+            );
+
+            if (wake_result != 0) {
+                fprintf(stderr,
+                        "pthread_kill for signal thread: %s\n",
+                        strerror(wake_result));
+            }
+        }
+
+        int result = pthread_join(sw->signal_thread, NULL);
         if (result != 0) {
             fprintf(stderr, "pthread_join for signal thread: %s\n",
                     strerror(result));
@@ -628,29 +1051,20 @@ static void cleanup_switch(switch_state_t *sw)
     }
 
     pthread_mutex_lock(&sw->ports_mutex);
-
     for (size_t i = 0; i < sw->num_ports; i++) {
         switch_port_t *port = &sw->ports[i];
-
         if (port->active && port->fd >= 0) {
             if (shutdown(port->fd, SHUT_RDWR) != 0 && errno != ENOTCONN) {
                 perror("shutdown");
             }
         }
     }
-
     pthread_mutex_unlock(&sw->ports_mutex);
 
-    /*
-     * Join receiver threads. They perform their own
-     * queue and socket cleanup.
-     */
     for (size_t i = 0; i < sw->num_ports; i++) {
         switch_port_t *port = &sw->ports[i];
-
         if (port->thread_started) {
             int result = pthread_join(port->receiver_thread, NULL);
-
             if (result != 0) {
                 fprintf(stderr, "pthread_join for port %zu: %s\n",
                         i, strerror(result));
@@ -660,18 +1074,38 @@ static void cleanup_switch(switch_state_t *sw)
         }
     }
 
+    /* The sniffer thread notices stopping within its 250 ms poll interval. */
+    if (sw->sniffer_thread_started) {
+        int result = pthread_join(sw->sniffer_thread, NULL);
+        if (result != 0) {
+            fprintf(stderr, "pthread_join for sniffer thread: %s\n",
+                    strerror(result));
+        } else {
+            sw->sniffer_thread_started = 0;
+        }
+    }
+
+    if (sw->sniffer_listen_fd >= 0) {
+        close(sw->sniffer_listen_fd);
+        sw->sniffer_listen_fd = -1;
+    }
+    (void)unlink(SNIFFER_SOCKET_PATH);
+
+    if (sw->mirror_mutex_initialized) {
+        pthread_mutex_destroy(&sw->mirror_mutex);
+        sw->mirror_mutex_initialized = 0;
+    }
+
     mac_table_destroy(&sw->mac_table);
 
     if (sw->stats != NULL) {
         shm_stats_detach(sw->stats, sw->stats_fd);
         sw->stats = NULL;
     }
-
     shm_stats_unlink(SHM_STATS_NAME);
 
     sem_destroy(&sw->free_ports);
     pthread_mutex_destroy(&sw->ports_mutex);
-
     free(sw->ports);
 }
 
@@ -729,6 +1163,8 @@ int main(int argc, char *argv[])
 
     sw.listen_fd = -1;
     sw.stats_fd = -1;
+    sw.sniffer_listen_fd = -1;
+    sw.sniffer_fd = -1;
     sw.num_ports = (size_t)num_ports;
     sw.signal_set = signal_set;
 
@@ -745,14 +1181,30 @@ int main(int argc, char *argv[])
         sw.ports[i].fd = -1;
     }
 
+    if (configure_vlan_ports(&sw) != 0) {
+        free(sw.ports);
+        return EXIT_FAILURE;
+    }
+
     if (pthread_mutex_init(&sw.ports_mutex, NULL) != 0) {
         fprintf(stderr, "Could not initialize ports mutex\n");
         free(sw.ports);
         return EXIT_FAILURE;
     }
 
+    int mirror_mutex_result = pthread_mutex_init(&sw.mirror_mutex, NULL);
+    if (mirror_mutex_result != 0) {
+        fprintf(stderr, "Could not initialize mirror mutex: %s\n",
+                strerror(mirror_mutex_result));
+        pthread_mutex_destroy(&sw.ports_mutex);
+        free(sw.ports);
+        return EXIT_FAILURE;
+    }
+    sw.mirror_mutex_initialized = 1;
+
     if (sem_init(&sw.free_ports, 0, (unsigned int)sw.num_ports) != 0) {
         perror("sem_init");
+        pthread_mutex_destroy(&sw.mirror_mutex);
         pthread_mutex_destroy(&sw.ports_mutex);
         free(sw.ports);
         return EXIT_FAILURE;
@@ -766,6 +1218,7 @@ int main(int argc, char *argv[])
 
         fprintf(stderr, "Could not initialize MAC table\n");
         sem_destroy(&sw.free_ports);
+        pthread_mutex_destroy(&sw.mirror_mutex);
         pthread_mutex_destroy(&sw.ports_mutex);
         free(sw.ports);
         return EXIT_FAILURE;
@@ -782,6 +1235,7 @@ int main(int argc, char *argv[])
         fprintf(stderr, "Could not configure MAC port security\n");
         mac_table_destroy(&sw.mac_table);
         sem_destroy(&sw.free_ports);
+        pthread_mutex_destroy(&sw.mirror_mutex);
         pthread_mutex_destroy(&sw.ports_mutex);
         free(sw.ports);
         return EXIT_FAILURE;
@@ -797,14 +1251,36 @@ int main(int argc, char *argv[])
         perror("shm_stats_create");
         mac_table_destroy(&sw.mac_table);
         sem_destroy(&sw.free_ports);
+        pthread_mutex_destroy(&sw.mirror_mutex);
         pthread_mutex_destroy(&sw.ports_mutex);
         free(sw.ports);
         return EXIT_FAILURE;
     }
 
+    sw.sniffer_listen_fd = create_sniffer_listener();
+    if (sw.sniffer_listen_fd < 0) {
+        perror("create_sniffer_listener");
+        cleanup_switch(&sw);
+        return EXIT_FAILURE;
+    }
+
+    int sniffer_result = pthread_create(
+        &sw.sniffer_thread, NULL, sniffer_thread_main, &sw);
+    if (sniffer_result != 0) {
+        fprintf(stderr, "Could not start sniffer thread: %s\n",
+                strerror(sniffer_result));
+        cleanup_switch(&sw);
+        return EXIT_FAILURE;
+    }
+    sw.sniffer_thread_started = 1;
+
     admin_context_t admin_context = {
         .mac_table = &sw.mac_table,
-        .stats = sw.stats
+        .stats = sw.stats,
+        .mirror_context = &sw,
+        .num_ports = sw.num_ports,
+        .set_mirror = set_mirror_callback,
+        .show_mirror = show_mirror_callback
     };
 
     if (admin_server_start(
@@ -849,6 +1325,7 @@ int main(int argc, char *argv[])
     printf("TCP port: %ld\n", tcp_port);
     printf("Maximum switch ports: %ld\n", num_ports);
     printf("Admin socket: %s\n", ADMIN_SOCKET_PATH);
+    printf("Sniffer socket: %s\n", SNIFFER_SOCKET_PATH);
 
     while (!atomic_load(&sw.stopping)) {
         struct sockaddr_in client_address;

@@ -1,3 +1,4 @@
+
 #define _POSIX_C_SOURCE 200809L
 
 #include "admin_commands.h"
@@ -47,11 +48,8 @@ static int handle_show_mac(
     FILE *stream = open_memstream(&buffer, &buffer_size);
 
     if (stream == NULL) {
-        snprintf(
-            response,
-            response_size,
-            "ERROR: Could not create MAC table output.\n"
-        );
+        snprintf(response, response_size,
+                 "ERROR: Could not create MAC table output.\n");
         return -1;
     }
 
@@ -59,38 +57,26 @@ static int handle_show_mac(
 
     if (fclose(stream) != 0) {
         free(buffer);
-
-        snprintf(
-            response,
-            response_size,
-            "ERROR: Could not generate MAC table output.\n"
-        );
-
+        snprintf(response, response_size,
+                 "ERROR: Could not generate MAC table output.\n");
         return -1;
     }
 
     if (result != 0) {
         free(buffer);
-
-        snprintf(
-            response,
-            response_size,
-            "ERROR: Could not read MAC table.\n"
-        );
-
+        snprintf(response, response_size,
+                 "ERROR: Could not read MAC table.\n");
         return -1;
     }
 
     if (buffer_size >= response_size) {
         memcpy(response, buffer, response_size - 1);
         response[response_size - 1] = '\0';
-
         free(buffer);
         return 0;
     }
 
     memcpy(response, buffer, buffer_size + 1);
-
     free(buffer);
 
     return 0;
@@ -108,12 +94,8 @@ static int handle_clear_mac(
     size_t previous_entries = mac_table_size(table);
 
     if (mac_table_clear(table) != 0) {
-        snprintf(
-            response,
-            response_size,
-            "ERROR: Could not clear MAC table.\n"
-        );
-
+        snprintf(response, response_size,
+                 "ERROR: Could not clear MAC table.\n");
         return -1;
     }
 
@@ -138,12 +120,8 @@ static int handle_show_ports(
 )
 {
     if (stats == NULL) {
-        snprintf(
-            response,
-            response_size,
-            "ERROR: Port statistics are unavailable.\n"
-        );
-
+        snprintf(response, response_size,
+                 "ERROR: Port statistics are unavailable.\n");
         return -1;
     }
 
@@ -162,7 +140,6 @@ static int handle_show_ports(
     used = (size_t)written;
 
     for (size_t i = 0; i < stats->num_ports; i++) {
-
         port_stats_t port_stats;
 
         if (shm_stats_read(stats, i, &port_stats) != 0) {
@@ -172,7 +149,6 @@ static int handle_show_ports(
                 "\nERROR: Could not read statistics for port %zu.\n",
                 i
             );
-
             return -1;
         }
 
@@ -182,10 +158,10 @@ static int handle_show_ports(
             response + used,
             remaining,
             "\nPort %zu\n"
-            "  Frames received:  %llu\n"
+            "  Frames received:    %llu\n"
             "  Frames transmitted: %llu\n"
-            "  Frames dropped:   %llu\n"
-            "  Frames mirrored:  %llu\n",
+            "  Frames dropped:     %llu\n"
+            "  Frames mirrored:    %llu\n",
             i,
             (unsigned long long)port_stats.frames_in,
             (unsigned long long)port_stats.frames_out,
@@ -198,14 +174,14 @@ static int handle_show_ports(
             size_t length = sizeof(truncated) - 1;
 
             if (remaining > length) {
-                memcpy(response + response_size - length - 1,
-                       truncated,
-                       length);
-                response[response_size - 1] = '\0';
-            } else {
-                response[response_size - 1] = '\0';
+                memcpy(
+                    response + response_size - length - 1,
+                    truncated,
+                    length
+                );
             }
 
+            response[response_size - 1] = '\0';
             return 0;
         }
 
@@ -213,6 +189,123 @@ static int handle_show_ports(
     }
 
     return 0;
+}
+
+/*
+ * Configure mirroring for a selected switch port.
+ *
+ * Commands:
+ * mirror <port> on
+ * mirror <port> off
+ */
+static int handle_mirror_command(
+    admin_context_t *admin,
+    const char *command,
+    char *response,
+    size_t response_size
+)
+{
+    size_t port_id;
+    char action[8];
+    char extra;
+
+    int fields = sscanf(
+        command,
+        "mirror %zu %7s %c",
+        &port_id,
+        action,
+        &extra
+    );
+
+    if (fields != 2) {
+        snprintf(
+            response,
+            response_size,
+            "Usage: mirror <port> on|off\n"
+        );
+        return -1;
+    }
+
+    if (port_id >= admin->num_ports) {
+        snprintf(
+            response,
+            response_size,
+            "ERROR: Invalid port number.\n"
+        );
+        return -1;
+    }
+
+    int enabled;
+
+    if (strcmp(action, "on") == 0) {
+        enabled = 1;
+    } else if (strcmp(action, "off") == 0) {
+        enabled = 0;
+    } else {
+        snprintf(
+            response,
+            response_size,
+            "Usage: mirror <port> on|off\n"
+        );
+        return -1;
+    }
+
+    if (admin->set_mirror == NULL) {
+        snprintf(
+            response,
+            response_size,
+            "ERROR: Mirroring is unavailable.\n"
+        );
+        return -1;
+    }
+
+    if (admin->set_mirror(
+            admin->mirror_context,
+            port_id,
+            enabled
+        ) != 0) {
+        snprintf(
+            response,
+            response_size,
+            "ERROR: Could not configure mirroring.\n"
+        );
+        return -1;
+    }
+
+    snprintf(
+        response,
+        response_size,
+        "Mirroring %s for port %zu.\n",
+        enabled ? "enabled" : "disabled",
+        port_id
+    );
+
+    return 0;
+}
+
+/*
+ * Display mirror configuration and status.
+ */
+static int handle_show_mirror(
+    admin_context_t *admin,
+    char *response,
+    size_t response_size
+)
+{
+    if (admin->show_mirror == NULL) {
+        snprintf(
+            response,
+            response_size,
+            "ERROR: Mirror information is unavailable.\n"
+        );
+        return -1;
+    }
+
+    return admin->show_mirror(
+        admin->mirror_context,
+        response,
+        response_size
+    );
 }
 
 /*
@@ -246,14 +339,9 @@ int admin_handle_command(
     trim_command(command_copy);
 
     if (strcmp(command_copy, "show mac") == 0) {
-
         if (admin->mac_table == NULL) {
-            snprintf(
-                response,
-                response_size,
-                "ERROR: MAC table is unavailable.\n"
-            );
-
+            snprintf(response, response_size,
+                     "ERROR: MAC table is unavailable.\n");
             return -1;
         }
 
@@ -265,14 +353,9 @@ int admin_handle_command(
     }
 
     if (strcmp(command_copy, "clear mac") == 0) {
-
         if (admin->mac_table == NULL) {
-            snprintf(
-                response,
-                response_size,
-                "ERROR: MAC table is unavailable.\n"
-            );
-
+            snprintf(response, response_size,
+                     "ERROR: MAC table is unavailable.\n");
             return -1;
         }
 
@@ -284,9 +367,25 @@ int admin_handle_command(
     }
 
     if (strcmp(command_copy, "show ports") == 0) {
-
         return handle_show_ports(
             admin->stats,
+            response,
+            response_size
+        );
+    }
+
+    if (strcmp(command_copy, "show mirror") == 0) {
+        return handle_show_mirror(
+            admin,
+            response,
+            response_size
+        );
+    }
+
+    if (strncmp(command_copy, "mirror ", 7) == 0) {
+        return handle_mirror_command(
+            admin,
+            command_copy,
             response,
             response_size
         );
