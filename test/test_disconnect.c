@@ -88,7 +88,13 @@ static int test_epipe_handling(void)
      */
     close(sockets[1]);
 
-    uint8_t frame[17] = {0};
+    uint8_t frame[17] = {
+    0x00, 0x00,             /* Payload length: 0 */
+    0x02, 0x00, 0x00, 0x00, 0x00, 0x01, /* Source MAC */
+    0x02, 0x00, 0x00, 0x00, 0x00, 0x02, /* Destination MAC */
+    0x00, 0x01,             /* VLAN: 1 */
+    0x00                    /* Priority: 0 */
+};
 
     errno = 0;
 

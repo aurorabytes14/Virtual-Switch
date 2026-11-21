@@ -33,16 +33,21 @@ static void *sender_worker(void *argument)
 
         pthread_mutex_unlock(&queue->mutex);
 
-        if (frame_send(
-                queue->socket_fd,
-                frame->data,
-                frame->size
-            ) == 0) {
+        int send_result = frame_send(
+            queue->socket_fd,
+            frame->data,
+            frame->size
+        );
 
-            pthread_mutex_lock(&queue->mutex);
+        pthread_mutex_lock(&queue->mutex);
+
+        if (send_result == 0) {
             queue->sent_frames++;
-            pthread_mutex_unlock(&queue->mutex);
+        } else {
+            queue->failed_frames++;
         }
+
+        pthread_mutex_unlock(&queue->mutex);
 
         shared_frame_release(frame);
     }
@@ -82,6 +87,7 @@ int port_queue_init(
 
     queue->dropped_frames = 0;
     queue->sent_frames = 0;
+    queue->failed_frames = 0;
 
     int result = pthread_mutex_init(
         &queue->mutex,
@@ -90,6 +96,7 @@ int port_queue_init(
 
     if (result != 0) {
         free(queue->items);
+        queue->items = NULL;
         errno = result;
         return -1;
     }
@@ -102,6 +109,7 @@ int port_queue_init(
     if (result != 0) {
         pthread_mutex_destroy(&queue->mutex);
         free(queue->items);
+        queue->items = NULL;
         errno = result;
         return -1;
     }
@@ -117,6 +125,7 @@ int port_queue_init(
         pthread_cond_destroy(&queue->not_empty);
         pthread_mutex_destroy(&queue->mutex);
         free(queue->items);
+        queue->items = NULL;
         errno = result;
         return -1;
     }
@@ -203,6 +212,12 @@ int port_queue_resume_sender(port_queue_t *queue)
 
     pthread_mutex_lock(&queue->mutex);
 
+    if (queue->stopping) {
+        pthread_mutex_unlock(&queue->mutex);
+        errno = ESHUTDOWN;
+        return -1;
+    }
+
     queue->sender_paused = 0;
 
     pthread_cond_broadcast(&queue->not_empty);
@@ -254,4 +269,4 @@ void port_queue_destroy(port_queue_t *queue)
 
     queue->items = NULL;
     queue->started = 0;
-}
+}   

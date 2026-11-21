@@ -20,8 +20,9 @@ typedef struct {
     int sender_paused;
     int started;
 
-    size_t dropped_frames;
-    size_t sent_frames;
+   size_t dropped_frames;
+   size_t sent_frames;
+   size_t failed_frames;
 
     pthread_mutex_t mutex;
     pthread_cond_t not_empty;

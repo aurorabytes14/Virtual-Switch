@@ -13,7 +13,8 @@
 
 typedef void (*port_shutdown_callback_t)(int port, void *context);
 
-typedef struct mac_entry {
+typedef struct mac_entry 
+{
     uint8_t mac[6];
     int port;
     time_t last_seen;
